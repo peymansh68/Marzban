@@ -1,10 +1,10 @@
 import json
+import re
 from enum import Enum
 from typing import Optional, Union
 from uuid import UUID, uuid4
-import re
 
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.utils.system import random_password
 from xray_api.types.account import (
@@ -13,10 +13,13 @@ from xray_api.types.account import (
     TrojanAccount,
     VLESSAccount,
     VMessAccount,
-    XTLSFlows
+    XTLSFlows,
 )
 
-FRAGMENT_PATTERN = re.compile(r'^((\d{1,3}-\d{1,3})|(\d{1,3})),((\d{1,3}-\d{1,3})|(\d{1,3})),(tlshello|\d|\d\-\d)$')
+FRAGMENT_PATTERN = re.compile(r'^((\d{1,4}-\d{1,4})|(\d{1,4})),((\d{1,3}-\d{1,3})|(\d{1,3})),(tlshello|\d|\d\-\d)$')
+
+NOISE_PATTERN = re.compile(
+    r'^(rand:(\d{1,4}-\d{1,4}|\d{1,4})|str:.+|hex:.+|base64:.+)(,(\d{1,4}-\d{1,4}|\d{1,4}))?(&(rand:(\d{1,4}-\d{1,4}|\d{1,4})|str:.+|hex:.+|base64:.+)(,(\d{1,4}-\d{1,4}|\d{1,4}))?)*$')
 
 
 class ProxyTypes(str, Enum):
@@ -50,10 +53,10 @@ class ProxyTypes(str, Enum):
             return ShadowsocksSettings
 
 
-class ProxySettings(BaseModel):
+class ProxySettings(BaseModel, use_enum_values=True):
     @classmethod
     def from_dict(cls, proxy_type: ProxyTypes, _dict: dict):
-        return ProxyTypes(proxy_type).settings_model.parse_obj(_dict)
+        return ProxyTypes(proxy_type).settings_model.model_validate(_dict)
 
     def dict(self, *, no_obj=False, **kwargs):
         if no_obj:
@@ -149,12 +152,12 @@ class ProxyHost(BaseModel):
     is_disabled: Union[bool, None] = None
     mux_enable: Union[bool, None] = None
     fragment_setting: Optional[str] = Field(None, nullable=True)
+    noise_setting: Optional[str] = Field(None, nullable=True)
     random_user_agent: Union[bool, None] = None
+    use_sni_as_host: Union[bool, None] = None
+    model_config = ConfigDict(from_attributes=True)
 
-    class Config:
-        orm_mode = True
-
-    @validator("remark", pre=False, always=True)
+    @field_validator("remark", mode="after")
     def validate_remark(cls, v):
         try:
             v.format_map(FormatVariables())
@@ -163,7 +166,7 @@ class ProxyHost(BaseModel):
 
         return v
 
-    @validator("address", pre=False, always=True)
+    @field_validator("address", mode="after")
     def validate_address(cls, v):
         try:
             v.format_map(FormatVariables())
@@ -172,12 +175,27 @@ class ProxyHost(BaseModel):
 
         return v
 
-    @validator("fragment_setting", check_fields=False)
+    @field_validator("fragment_setting", check_fields=False)
+    @classmethod
     def validate_fragment(cls, v):
         if v and not FRAGMENT_PATTERN.match(v):
             raise ValueError(
                 "Fragment setting must be like this: length,interval,packet (10-100,100-200,tlshello)."
             )
+        return v
+
+    @field_validator("noise_setting", check_fields=False)
+    @classmethod
+    def validate_noise(cls, v):
+        if v:
+            if not NOISE_PATTERN.match(v):
+                raise ValueError(
+                    "Noise setting must be like this: packet,delay (rand:10-20,100-200)."
+                )
+            if len(v) > 2000:
+                raise ValueError(
+                    "Noise can't be longer that 2000 character"
+                )
         return v
 
 

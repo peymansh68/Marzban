@@ -17,6 +17,15 @@ from app.utils.crypto import get_cert_SANs
 from config import DEBUG, XRAY_EXCLUDE_INBOUND_TAGS, XRAY_FALLBACKS_INBOUND_TAG
 
 
+def merge_dicts(a, b):  # B will override A dictionary key and values
+    for key, value in b.items():
+        if isinstance(value, dict) and key in a and isinstance(a[key], dict):
+            merge_dicts(a[key], value)  # Recursively merge nested dictionaries
+        else:
+            a[key] = value
+    return a
+
+
 class XRayConfig(dict):
     def __init__(self,
                  config: Union[dict, str, PosixPath] = {},
@@ -69,7 +78,7 @@ class XRayConfig(dict):
             "tag": "API"
         }
         self["stats"] = {}
-        self["policy"] = {
+        forced_policies = {
             "levels": {
                 "0": {
                     "statsUserUplink": True,
@@ -83,6 +92,10 @@ class XRayConfig(dict):
                 "statsOutboundUplink": True
             }
         }
+        if self.get("policy"):
+            self["policy"] = merge_dicts(self.get("policy"), forced_policies)
+        else:
+            self["policy"] = forced_policies
         inbound = {
             "listen": self.api_host,
             "port": self.api_port,
@@ -224,7 +237,8 @@ class XRayConfig(dict):
                                 f"You need to provide publicKey in realitySettings of {inbound['tag']}")
 
                     try:
-                        settings['sid'] = tls_settings.get('shortIds')[0]
+                        settings['sids'] = tls_settings.get('shortIds')
+                        settings['sids'][0]  # check if there is any shortIds
                     except (IndexError, TypeError):
                         raise ValueError(
                             f"You need to define at least one shortID in realitySettings of {inbound['tag']}")
@@ -233,7 +247,7 @@ class XRayConfig(dict):
                     except:
                         settings['spx'] = ""
 
-                if net == 'tcp':
+                if net in ('tcp', 'raw'):
                     header = net_settings.get('header', {})
                     request = header.get('request', {})
                     path = request.get('path')
@@ -253,7 +267,7 @@ class XRayConfig(dict):
 
                 elif net == 'ws':
                     path = net_settings.get('path', '')
-                    host = net_settings.get('headers', {}).get('Host')
+                    host = net_settings.get('host', '') or net_settings.get('headers', {}).get('Host')
 
                     settings['header_type'] = ''
 
@@ -267,6 +281,7 @@ class XRayConfig(dict):
                     if isinstance(host, str):
                         settings['host'] = [host]
 
+                    settings["heartbeatPeriod"] = net_settings.get('heartbeatPeriod', 0)
                 elif net == 'grpc' or net == 'gun':
                     settings['header_type'] = ''
                     settings['path'] = net_settings.get('serviceName', '')
@@ -284,12 +299,18 @@ class XRayConfig(dict):
                     host = net_settings.get('host', '')
                     settings['host'] = [host]
 
-                elif net == 'splithttp':
+                elif net in ('splithttp', 'xhttp'):
                     settings['path'] = net_settings.get('path', '')
                     host = net_settings.get('host', '')
                     settings['host'] = [host]
-                    settings['maxUploadSize'] = net_settings.get('maxUploadSize', 1000000)
-                    settings['maxConcurrentUploads'] = net_settings.get('maxConcurrentUploads', 10)
+                    settings['scMaxEachPostBytes'] = net_settings.get('scMaxEachPostBytes', 1000000)
+                    settings['scMaxConcurrentPosts'] = net_settings.get('scMaxConcurrentPosts', 100)
+                    settings['scMinPostsIntervalMs'] = net_settings.get('scMinPostsIntervalMs', 30)
+                    settings['xPaddingBytes'] = net_settings.get('xPaddingBytes', "100-1000")
+                    settings['xmux'] = net_settings.get('xmux', {})
+                    settings["mode"] = net_settings.get("mode", "auto")
+                    settings["noGRPCHeader"] = net_settings.get("noGRPCHeader", False)
+                    settings["keepAlivePeriod"] = net_settings.get("keepAlivePeriod", 0)
 
                 elif net == 'kcp':
                     header = net_settings.get('header', {})
@@ -298,14 +319,20 @@ class XRayConfig(dict):
                     settings['host'] = header.get('domain', '')
                     settings['path'] = net_settings.get('seed', '')
 
+                elif net in ("http", "h2", "h3"):
+                    net_settings = stream.get("httpSettings", {})
+
+                    settings['host'] = net_settings.get('host') or net_settings.get('Host', '')
+                    settings['path'] = net_settings.get('path', '')
+
                 else:
                     settings['path'] = net_settings.get('path', '')
                     host = net_settings.get(
                         'host', {}) or net_settings.get('Host', {})
-                    if host and isinstance(host, list):
-                        settings['host'] = host[0]
-                    elif host and isinstance(host, str):
+                    if host and isinstance(host, str):
                         settings['host'] = host
+                    elif host and isinstance(host, list):
+                        settings['host'] = host[0]
 
             self.inbounds.append(settings)
             self.inbounds_by_tag[inbound['tag']] = settings
@@ -344,7 +371,8 @@ class XRayConfig(dict):
             ).join(
                 db_models.Proxy, db_models.User.id == db_models.Proxy.user_id
             ).outerjoin(
-                db_models.excluded_inbounds_association, db_models.Proxy.id == db_models.excluded_inbounds_association.c.proxy_id
+                db_models.excluded_inbounds_association,
+                db_models.Proxy.id == db_models.excluded_inbounds_association.c.proxy_id
             ).filter(
                 db_models.User.status.in_([UserStatus.active, UserStatus.on_hold])
             ).group_by(
@@ -358,11 +386,11 @@ class XRayConfig(dict):
             grouped_data = defaultdict(list)
 
             for row in result:
-                grouped_data[row["type"]].append((
-                    row["id"],
-                    row["username"],
-                    row["settings"],
-                    [i for i in row['excluded_inbound_tags'].split(',') if i] if row['excluded_inbound_tags'] else None
+                grouped_data[row.type].append((
+                    row.id,
+                    row.username,
+                    row.settings,
+                    [i for i in row.excluded_inbound_tags.split(',') if i] if row.excluded_inbound_tags else None
                 ))
 
             for proxy_type, rows in grouped_data.items():
@@ -387,15 +415,15 @@ class XRayConfig(dict):
 
                         # XTLS currently only supports transmission methods of TCP and mKCP
                         if client.get('flow') and (
-                            inbound.get('network', 'tcp') not in ('tcp', 'kcp')
-                            or
-                            (
-                                inbound.get('network', 'tcp') in ('tcp', 'kcp')
-                                and
-                                inbound.get('tls') not in ('tls', 'reality')
-                            )
-                            or
-                            inbound.get('header_type') == 'http'
+                                inbound.get('network', 'tcp') not in ('tcp', 'raw', 'kcp')
+                                or
+                                (
+                                    inbound.get('network', 'tcp') in ('tcp', 'raw', 'kcp')
+                                    and
+                                    inbound.get('tls') not in ('tls', 'reality')
+                                )
+                                or
+                                inbound.get('header_type') == 'http'
                         ):
                             del client['flow']
 
